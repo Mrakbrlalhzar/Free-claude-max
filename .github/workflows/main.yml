@@ -2,19 +2,42 @@ name: Build radare2 + r2ghidra for Termux (arm)
 on:
   workflow_dispatch:
   push:
+    paths:
+      - '.github/workflows/build-radare2-r2ghidra.yml' # rename to match this file's actual path
+  # Uncomment for automatic nightly rebuilds against upstream master:
+  # schedule:
+  #   - cron: '0 3 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
+      - name: Free up disk space
+        run: |
+          echo "Disk space before cleanup:"
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          echo "Disk space after cleanup:"
+          df -h /
+
       - name: Checkout termux-packages (upstream build system)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7 # v7.0.1
         with:
           repository: termux/termux-packages
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Point build.sh at radare2 git master
         run: |
+          set -euo pipefail
           sed -i \
             -e 's|^TERMUX_PKG_SRCURL=.*|TERMUX_PKG_SRCURL=git+https://github.com/radareorg/radare2.git|' \
             -e 's|^TERMUX_PKG_SHA256=.*|TERMUX_PKG_SHA256=SKIP_CHECKSUM|' \
@@ -23,6 +46,7 @@ jobs:
 
       - name: Build missing dependencies explicitly
         run: |
+          set -euo pipefail
           # Build these so their .deb files are placed in the output directory
           ./scripts/run-docker.sh ./build-package.sh -a arm -I libuv
           ./scripts/run-docker.sh ./build-package.sh -a arm -I libandroid-spawn
@@ -30,34 +54,87 @@ jobs:
       - name: Build radare2
         run: ./scripts/run-docker.sh ./build-package.sh -a arm -I radare2
 
-      - name: Pre-fetch r2ghidra and compile native sleighc
+      - name: Clone r2ghidra source
+        id: r2ghidra_src
+        timeout-minutes: 10
         run: |
-          sudo apt-get update && sudo apt-get install -y meson ninja-build
-          
-          git clone --depth=1 -b master https://github.com/radareorg/r2ghidra.git packages/r2ghidra/git-src
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            rm -rf packages/r2ghidra/git-src
+            if git clone --depth=1 -b master https://github.com/radareorg/r2ghidra.git packages/r2ghidra/git-src; then
+              break
+            fi
+            echo "Clone attempt $attempt failed, retrying in 10s..."
+            sleep 10
+          done
+          echo "sha=$(git -C packages/r2ghidra/git-src rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache compiled native sleighc
+        id: sleighc_cache
+        uses: actions/cache@v6
+        with:
+          path: packages/r2ghidra/sleighc-native
+          key: sleighc-native-${{ runner.os }}-${{ steps.r2ghidra_src.outputs.sha }}
+
+      - name: Install native build tools (meson, ninja)
+        if: steps.sleighc_cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends meson ninja-build
+
+      - name: Cache meson subprojects (r2ghidra)
+        if: steps.sleighc_cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v6
+        with:
+          path: packages/r2ghidra/git-src/subprojects
+          key: meson-subprojects-r2ghidra-${{ hashFiles('packages/r2ghidra/git-src/subprojects/*.wrap') }}
+          restore-keys: |
+            meson-subprojects-r2ghidra-
+
+      - name: Download r2ghidra meson subprojects
+        if: steps.sleighc_cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
           cd packages/r2ghidra/git-src
-          
           meson subprojects download
-          
-          cd subprojects/ghidra-native
+
+      - name: Cache meson subprojects (ghidra-native)
+        if: steps.sleighc_cache.outputs.cache-hit != 'true'
+        uses: actions/cache@v6
+        with:
+          path: packages/r2ghidra/git-src/subprojects/ghidra-native/subprojects
+          key: meson-subprojects-ghidra-native-${{ hashFiles('packages/r2ghidra/git-src/subprojects/ghidra-native/subprojects/*.wrap') }}
+          restore-keys: |
+            meson-subprojects-ghidra-native-
+
+      - name: Compile native sleighc
+        if: steps.sleighc_cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          cd packages/r2ghidra/git-src/subprojects/ghidra-native
           meson subprojects download
           meson setup build-native --prefer-static
           ninja -C build-native sleighc
-          
+
           SLEIGHC_BIN=$(find build-native -type f -name sleighc -executable | head -n 1)
           cp "$SLEIGHC_BIN" ../../../sleighc-native
           chmod +x ../../../sleighc-native
 
       - name: Define a local r2ghidra package
         run: |
+          set -euo pipefail
           mkdir -p packages/r2ghidra
-          
+
           # Extract the EXACT radare2 version being used to guarantee a match and safe filename
-          R2_VER=$(grep -m1 "^TERMUX_PKG_VERSION=" packages/radare2/build.sh | cut -d= -f2 | tr -d '"' | tr -d "'")
+          R2_VER=$(grep -m1 "^TERMUX_PKG_VERSION=" packages/radare2/build.sh | cut -d= -f2 | tr -d '"' | tr -d "'") || true
           R2_VER=${R2_VER#*:} # Remove epoch if present (e.g. 1:6.2.0 -> 6.2.0)
-          if [ -z "$R2_VER" ]; then R2_VER="6.2.0"; fi
+          if [ -z "$R2_VER" ]; then
+            echo "::error::Could not determine radare2 version from packages/radare2/build.sh - refusing to guess a fallback, since a wrong version silently breaks plugin loading."
+            exit 1
+          fi
           echo "Using exact radare2 version for plugin alignment: $R2_VER"
-          
+
           cat > packages/r2ghidra/build.sh <<'EOF'
           TERMUX_PKG_HOMEPAGE=https://github.com/radareorg/r2ghidra
           TERMUX_PKG_DESCRIPTION="Ghidra decompiler plugin for radare2"
@@ -147,7 +224,9 @@ jobs:
         run: ./scripts/run-docker.sh ./build-package.sh -a arm -I r2ghidra
 
       - name: Upload all built .deb artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7 # v7.0.1
         with:
-          name: radare2-and-r2ghidra-termux-arm
+          name: radare2-and-r2ghidra-termux-arm-${{ github.run_number }}
           path: output/*.deb
+          if-no-files-found: error
+          retention-days: 14
