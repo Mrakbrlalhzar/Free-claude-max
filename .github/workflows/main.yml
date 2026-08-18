@@ -41,7 +41,7 @@ jobs:
           # Shallow clone radare2 master to extract base version and git commit date
           git clone --depth=1 https://github.com/radareorg/radare2.git /tmp/radare2-src
 
-          # Extract clean semver sequentially to avoid grep outputting file path prefixes
+          # Extract clean semver sequentially to prevent file path prefixes from grep
           R2_BASE_VER=""
           if [ -f /tmp/radare2-src/meson.build ]; then
             R2_BASE_VER=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' /tmp/radare2-src/meson.build | head -n 1)
@@ -52,7 +52,7 @@ jobs:
           if [ -z "$R2_BASE_VER" ]; then
             R2_BASE_VER=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' packages/radare2/build.sh | head -n 1)
           fi
-          if [ -z "$R2_BASE_VER" ]; then R2_BASE_VER="6.0.0"; fi
+          if [ -z "$R2_BASE_VER" ]; then R2_BASE_VER="6.2.1"; fi
 
           GIT_DATE=$(git -C /tmp/radare2-src log -1 --format=%cd --date=format:'%Y%m%d')
           R2_FULL_VER="${R2_BASE_VER}+git${GIT_DATE}"
@@ -79,7 +79,7 @@ jobs:
           set -euo pipefail
           ./scripts/run-docker.sh ./build-package.sh -a arm -I libuv libandroid-spawn radare2
 
-      - name: Pre-fetch r2ghidra and compile native sleighc
+      - name: Pre-fetch r2ghidra, compile native sleighc & pre-compile specs
         run: |
           set -euo pipefail
           sudo apt-get update && sudo apt-get install -y meson ninja-build
@@ -96,6 +96,16 @@ jobs:
           SLEIGHC_BIN=$(find build-native -type f -name sleighc -executable | head -n 1)
           cp "$SLEIGHC_BIN" ../../../sleighc-native
           chmod +x ../../../sleighc-native
+          cd ../../..
+
+          # Compile all Sleigh spec files (.slas -> .sla) using host sleighc-native
+          SLEIGHC_ABS_PATH="$(pwd)/sleighc-native"
+          echo "Pre-compiling Sleigh architecture specifications..."
+          find packages/r2ghidra/git-src -name "*.slas" | while read -r slas_file; do
+            dir=$(dirname "$slas_file")
+            base=$(basename "$slas_file")
+            (cd "$dir" && "$SLEIGHC_ABS_PATH" "$base") || true
+          done
 
       - name: Define local r2ghidra package
         run: |
@@ -167,14 +177,28 @@ jobs:
             local DEST_DIR="$TERMUX_PREFIX/lib/radare2/@R2_BASE_VER@"
             mkdir -p "$DEST_DIR"
 
-            local PLUGIN_FILE=$(find "$TERMUX_PREFIX" -name '*core*r2ghidra.so' -o -name '*core_ghidra.so' 2>/dev/null | head -n 1)
+            # 1. Install core_ghidra.so plugin
+            local PLUGIN_FILE
+            PLUGIN_FILE=$(find "$TERMUX_PREFIX" -name '*core*r2ghidra.so' -o -name '*core_ghidra.so' 2>/dev/null | head -n 1)
             if [ -n "$PLUGIN_FILE" ]; then
               mv "$PLUGIN_FILE" "$DEST_DIR/core_ghidra.so"
             fi
 
-            local SLEIGH_DIR=$(find "$TERMUX_PREFIX" -type d -name 'r2ghidra_sleigh' 2>/devnull | head -n 1)
-            if [ -n "$SLEIGH_DIR" ] && [ "$SLEIGH_DIR" != "$DEST_DIR/r2ghidra_sleigh" ]; then
-              mv "$SLEIGH_DIR" "$DEST_DIR/r2ghidra_sleigh"
+            # 2. Assemble and copy pre-compiled r2ghidra_sleigh directory structure
+            local TARGET_SLEIGH="$DEST_DIR/r2ghidra_sleigh"
+            mkdir -p "$TARGET_SLEIGH"
+
+            local SLEIGH_SRC
+            SLEIGH_SRC=$(find "$TERMUX_PKG_SRCDIR" -type d -name "processors" 2>/dev/null | head -n 1)
+            if [ -n "$SLEIGH_SRC" ] && [ -d "$SLEIGH_SRC" ]; then
+              cp -a "$SLEIGH_SRC" "$TARGET_SLEIGH/"
+              cp -a "$SLEIGH_SRC"/* "$TARGET_SLEIGH/" 2>/dev/null || true
+            fi
+
+            local INSTALLED_SLEIGH
+            INSTALLED_SLEIGH=$(find "$TERMUX_PREFIX" -type d \( -name 'r2ghidra_sleigh' -o -name 'sleigh' \) 2>/dev/null | grep -v "$TARGET_SLEIGH" | head -n 1)
+            if [ -n "$INSTALLED_SLEIGH" ] && [ -d "$INSTALLED_SLEIGH" ]; then
+              cp -a "$INSTALLED_SLEIGH"/* "$TARGET_SLEIGH/" 2>/dev/null || true
             fi
           }
           EOF
