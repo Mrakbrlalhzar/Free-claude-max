@@ -3,152 +3,103 @@ name: Build radare2 + r2ghidra for Termux (arm)
 on:
   workflow_dispatch:
   push:
-    branches:
-      - main
-      - master
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-permissions:
-  contents: read
 
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 180
-
     steps:
-      - name: Checkout termux-packages
+      - name: Checkout termux-packages (upstream build system)
         uses: actions/checkout@v4
         with:
           repository: termux/termux-packages
           fetch-depth: 1
 
-      - name: Setup ccache
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/ccache
-          key: ${{ runner.os }}-ccache-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-ccache-
-
-      - name: Fetch upstream version & update radare2 build spec
+      - name: Configure radare2 for git master
         run: |
-          set -euo pipefail
-
-          # Shallow clone radare2 master to extract base version and git commit date
-          git clone --depth=1 https://github.com/radareorg/radare2.git /tmp/radare2-src
-
-          # Extract clean semver sequentially to prevent file path prefixes from grep
-          R2_BASE_VER=""
-          if [ -f /tmp/radare2-src/meson.build ]; then
-            R2_BASE_VER=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' /tmp/radare2-src/meson.build | head -n 1)
-          fi
-          if [ -z "$R2_BASE_VER" ] && [ -f /tmp/radare2-src/configure.acr ]; then
-            R2_BASE_VER=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' /tmp/radare2-src/configure.acr | head -n 1)
-          fi
-          if [ -z "$R2_BASE_VER" ]; then
-            R2_BASE_VER=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' packages/radare2/build.sh | head -n 1)
-          fi
-          if [ -z "$R2_BASE_VER" ]; then R2_BASE_VER="6.2.1"; fi
-
-          GIT_DATE=$(git -C /tmp/radare2-src log -1 --format=%cd --date=format:'%Y%m%d')
-          R2_FULL_VER="${R2_BASE_VER}+git${GIT_DATE}"
-
-          # Ensure strictly safe version string formatting
-          R2_BASE_VER=$(echo "$R2_BASE_VER" | tr -cd '0-9.')
-          R2_FULL_VER=$(echo "$R2_FULL_VER" | tr -cd '0-9a-zA-Z+.')
-
-          echo "R2_BASE_VER=${R2_BASE_VER}" >> $GITHUB_ENV
-          echo "R2_FULL_VER=${R2_FULL_VER}" >> $GITHUB_ENV
-
-          # Patch radare2 build.sh with exact version tag and master git source
+          # 1. Fetch exact version from radare2 upstream master meson.build
+          # 2. Strip "-git" to strictly comply with Debian packaging rules (no hyphens allowed)
+          R2_VER=$(curl -s https://raw.githubusercontent.com/radareorg/radare2/master/meson.build | grep -m1 "version:" | cut -d "'" -f 2 | sed 's/-git//')
+          if [ -z "$R2_VER" ]; then R2_VER="6.2.0"; fi
+          
+          # Create a proper package version by appending today's date (so APT upgrades work)
+          PKG_VERSION="${R2_VER}+$(date +%Y%m%d)"
+          
+          echo "Upstream radare2 internal version: $R2_VER"
+          echo "Debian package formatted version: $PKG_VERSION"
+          
+          # Export for subsequent steps
+          echo "R2_VER=$R2_VER" >> $GITHUB_ENV
+          echo "PKG_VERSION=$PKG_VERSION" >> $GITHUB_ENV
+          
+          # Point build.sh at git master and set dynamic package version
           sed -i \
-            -e "s|^TERMUX_PKG_VERSION=.*|TERMUX_PKG_VERSION=\"${R2_FULL_VER}\"|" \
+            -e "s|^TERMUX_PKG_VERSION=.*|TERMUX_PKG_VERSION=${PKG_VERSION}|" \
             -e 's|^TERMUX_PKG_SRCURL=.*|TERMUX_PKG_SRCURL=git+https://github.com/radareorg/radare2.git|' \
             -e 's|^TERMUX_PKG_SHA256=.*|TERMUX_PKG_SHA256=SKIP_CHECKSUM|' \
             packages/radare2/build.sh
           echo 'TERMUX_PKG_GIT_BRANCH=master' >> packages/radare2/build.sh
 
-          rm -rf /tmp/radare2-src
-
-      - name: Build dependencies and radare2
+      - name: Pre-fetch r2ghidra and compile native sleighc
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          set -euo pipefail
-          ./scripts/run-docker.sh ./build-package.sh -a arm -I libuv libandroid-spawn radare2
-
-      - name: Pre-fetch r2ghidra, compile native sleighc & pre-compile specs
-        run: |
-          set -euo pipefail
-          sudo apt-get update && sudo apt-get install -y meson ninja-build
-
+          sudo apt-get update
+          sudo apt-get install -y meson ninja-build
+          
           git clone --depth=1 -b master https://github.com/radareorg/r2ghidra.git packages/r2ghidra/git-src
-
           cd packages/r2ghidra/git-src
+          
           meson subprojects download
-
+          
           cd subprojects/ghidra-native
-          meson setup build-native --prefer-static
+          meson subprojects download
+          
+          meson setup build-native --default-library=static
           ninja -C build-native sleighc
-
+          
           SLEIGHC_BIN=$(find build-native -type f -name sleighc -executable | head -n 1)
           cp "$SLEIGHC_BIN" ../../../sleighc-native
           chmod +x ../../../sleighc-native
-          cd ../../..
-
-          # Compile all Sleigh spec files (.slas -> .sla) using host sleighc-native
-          SLEIGHC_ABS_PATH="$(pwd)/sleighc-native"
-          echo "Pre-compiling Sleigh architecture specifications..."
-          find packages/r2ghidra/git-src -name "*.slas" | while read -r slas_file; do
-            dir=$(dirname "$slas_file")
-            base=$(basename "$slas_file")
-            (cd "$dir" && "$SLEIGHC_ABS_PATH" "$base") || true
-          done
 
       - name: Define local r2ghidra package
         run: |
-          set -euo pipefail
           mkdir -p packages/r2ghidra
-
+          
           cat > packages/r2ghidra/build.sh <<'EOF'
           TERMUX_PKG_HOMEPAGE=https://github.com/radareorg/r2ghidra
           TERMUX_PKG_DESCRIPTION="Ghidra decompiler plugin for radare2"
           TERMUX_PKG_LICENSE="LGPL-3.0"
           TERMUX_PKG_MAINTAINER="@you"
-
-          TERMUX_PKG_VERSION="@R2_FULL_VER@"
+          
+          # Use the date-stamped package version
+          TERMUX_PKG_VERSION="@PKG_VERSION@"
           TERMUX_PKG_SRCURL=git+https://github.com/radareorg/r2ghidra.git
           TERMUX_PKG_SHA256=SKIP_CHECKSUM
           TERMUX_PKG_GIT_BRANCH=master
-
+          
           TERMUX_PKG_DEPENDS="radare2, zlib"
-
+          
           termux_step_get_source() {
             rm -rf "$TERMUX_PKG_SRCDIR"
             cp -a "$TERMUX_PKG_BUILDER_DIR/git-src" "$TERMUX_PKG_SRCDIR"
           }
-
+          
           termux_step_pre_configure() {
             rm -f "$TERMUX_PKG_SRCDIR/configure"
-
-            python3 -c '
-          import sys
-          path = sys.argv[1]
-          native_bin = sys.argv[2]
-          with open(path, "r") as f:
-              lines = f.readlines()
-          lines.insert(1, f"import sys\nsys.argv[1] = \"{native_bin}\"\n")
-          with open(path, "w") as f:
-              f.writelines(lines)
-          ' "$TERMUX_PKG_SRCDIR/ghidra/sleigh_compile.py" "$TERMUX_PKG_BUILDER_DIR/sleighc-native"
-
+            
+            # Intercept Python's sleigh_compile.py to inject our native x86_64 sleighc binary
+            awk 'NR==2{print "import sys\nsys.argv[1] = \"'"$TERMUX_PKG_BUILDER_DIR"'/sleighc-native\""}1' \
+              "$TERMUX_PKG_SRCDIR/ghidra/sleigh_compile.py" > temp.py
+            mv temp.py "$TERMUX_PKG_SRCDIR/ghidra/sleigh_compile.py"
+            chmod +x "$TERMUX_PKG_SRCDIR/ghidra/sleigh_compile.py"
+            
             local shim_dir="$TERMUX_PKG_BUILDDIR/r2-shim"
             mkdir -p "$shim_dir"
-
-            local libr_plugins="$TERMUX_PREFIX/lib/radare2/@R2_BASE_VER@"
-
+            
+            # Tell Meson exactly where plugins belong using the STATIC core version (no date string)
+            local libr_plugins="$TERMUX_PREFIX/lib/radare2/@R2_VER@"
+            
             cat > "$shim_dir/r2" <<SHIM_EOF
           #!/bin/sh
           if [ "\$1" = "-H" ]; then
@@ -162,60 +113,44 @@ jobs:
             exit 0
           fi
           if [ "\$1" = "-qv" ] || [ "\$1" = "-v" ] || [ "\$1" = "-V" ]; then
-            echo "@R2_BASE_VER@"
+            echo "@R2_VER@"
             exit 0
           fi
           exit 0
           SHIM_EOF
             chmod +x "$shim_dir/r2"
             ln -s r2 "$shim_dir/radare2"
-
+            
             export PATH="$shim_dir:$PATH"
           }
-
+          
           termux_step_post_make_install() {
-            local DEST_DIR="$TERMUX_PREFIX/lib/radare2/@R2_BASE_VER@"
+            # Move the built plugins to the exact directory radare2 expects
+            local DEST_DIR="$TERMUX_PREFIX/lib/radare2/@R2_VER@"
             mkdir -p "$DEST_DIR"
-
-            # 1. Install core_ghidra.so plugin
-            local PLUGIN_FILE
-            PLUGIN_FILE=$(find "$TERMUX_PREFIX" -name '*core*r2ghidra.so' -o -name '*core_ghidra.so' 2>/dev/null | head -n 1)
+            
+            local PLUGIN_FILE=$(find "$TERMUX_PREFIX" -name '*core*r2ghidra.so' -o -name '*core_ghidra.so' 2>/dev/null | head -n 1)
             if [ -n "$PLUGIN_FILE" ]; then
               mv "$PLUGIN_FILE" "$DEST_DIR/core_ghidra.so"
             fi
-
-            # 2. Assemble and copy pre-compiled r2ghidra_sleigh directory structure
-            local TARGET_SLEIGH="$DEST_DIR/r2ghidra_sleigh"
-            mkdir -p "$TARGET_SLEIGH"
-
-            local SLEIGH_SRC
-            SLEIGH_SRC=$(find "$TERMUX_PKG_SRCDIR" -type d -name "processors" 2>/dev/null | head -n 1)
-            if [ -n "$SLEIGH_SRC" ] && [ -d "$SLEIGH_SRC" ]; then
-              cp -a "$SLEIGH_SRC" "$TARGET_SLEIGH/"
-              cp -a "$SLEIGH_SRC"/* "$TARGET_SLEIGH/" 2>/dev/null || true
-            fi
-
-            local INSTALLED_SLEIGH
-            INSTALLED_SLEIGH=$(find "$TERMUX_PREFIX" -type d \( -name 'r2ghidra_sleigh' -o -name 'sleigh' \) 2>/dev/null | grep -v "$TARGET_SLEIGH" | head -n 1)
-            if [ -n "$INSTALLED_SLEIGH" ] && [ -d "$INSTALLED_SLEIGH" ]; then
-              cp -a "$INSTALLED_SLEIGH"/* "$TARGET_SLEIGH/" 2>/dev/null || true
+            
+            local SLEIGH_DIR=$(find "$TERMUX_PREFIX" -type d -name 'r2ghidra_sleigh' 2>/dev/null | head -n 1)
+            if [ -n "$SLEIGH_DIR" ] && [ "$SLEIGH_DIR" != "$DEST_DIR/r2ghidra_sleigh" ]; then
+              mv "$SLEIGH_DIR" "$DEST_DIR/r2ghidra_sleigh"
             fi
           }
           EOF
+          
+          # Safely inject both the Package Version (Debian `.deb`) and Core Version (Paths)
+          sed -i "s|@PKG_VERSION@|$PKG_VERSION|g" packages/r2ghidra/build.sh
+          sed -i "s|@R2_VER@|$R2_VER|g" packages/r2ghidra/build.sh
 
-          sed -i \
-            -e "s|@R2_BASE_VER@|${R2_BASE_VER}|g" \
-            -e "s|@R2_FULL_VER@|${R2_FULL_VER}|g" \
-            packages/r2ghidra/build.sh
-
-      - name: Build r2ghidra
+      - name: Build dependencies and packages in Termux Docker Environment
         run: |
-          set -euo pipefail
-          ./scripts/run-docker.sh ./build-package.sh -a arm -I r2ghidra
+          ./scripts/run-docker.sh ./build-package.sh -a arm -I libuv libandroid-spawn radare2 r2ghidra
 
-      - name: Upload built .deb artifacts
+      - name: Upload all built .deb artifacts
         uses: actions/upload-artifact@v4
         with:
           name: radare2-and-r2ghidra-termux-arm
           path: output/*.deb
-          if-no-files-found: error
