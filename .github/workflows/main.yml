@@ -41,14 +41,19 @@ jobs:
           # Shallow clone radare2 master to extract base version and git commit date
           git clone --depth=1 https://github.com/radareorg/radare2.git /tmp/radare2-src
 
-          R2_BASE_VER=$(grep -E "version:" /tmp/radare2-src/meson.build | head -n 1 | cut -d"'" -f2 | tr -d ' ')
+          # Extract clean semver (e.g., 5.9.8) without extra tokens or colons
+          R2_BASE_VER=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' /tmp/radare2-src/configure.acr /tmp/radare2-src/meson.build 2>/dev/null | head -n 1)
           if [ -z "$R2_BASE_VER" ]; then
-            R2_BASE_VER=$(grep "^ACR_VERSION=" /tmp/radare2-src/configure.acr | cut -d= -f2 | tr -d ' ')
+            R2_BASE_VER=$(grep -oE '[0-9]+\.[0-9]+\.[0-9]+' packages/radare2/build.sh | head -n 1)
           fi
-          if [ -z "$R2_BASE_VER" ]; then R2_BASE_VER="6.0.0"; fi
+          if [ -z "$R2_BASE_VER" ]; then R2_BASE_VER="5.9.8"; fi
 
           GIT_DATE=$(git -C /tmp/radare2-src log -1 --format=%cd --date=format:'%Y%m%d')
           R2_FULL_VER="${R2_BASE_VER}+git${GIT_DATE}"
+
+          # Strip colons or illegal characters to guarantee artifact filename safety
+          R2_BASE_VER=$(echo "$R2_BASE_VER" | tr -d ':')
+          R2_FULL_VER=$(echo "$R2_FULL_VER" | tr -d ':')
 
           echo "R2_BASE_VER=${R2_BASE_VER}" >> $GITHUB_ENV
           echo "R2_FULL_VER=${R2_FULL_VER}" >> $GITHUB_ENV
@@ -156,7 +161,7 @@ jobs:
             local DEST_DIR="$TERMUX_PREFIX/lib/radare2/@R2_BASE_VER@"
             mkdir -p "$DEST_DIR"
 
-            local PLUGIN_FILE=$(find "$TERMUX_PREFIX" -name '*core*r2ghidra.so' -o -name '*core_ghidra.so' 2>/devnull | head -n 1)
+            local PLUGIN_FILE=$(find "$TERMUX_PREFIX" -name '*core*r2ghidra.so' -o -name '*core_ghidra.so' 2>/dev/null | head -n 1)
             if [ -n "$PLUGIN_FILE" ]; then
               mv "$PLUGIN_FILE" "$DEST_DIR/core_ghidra.so"
             fi
