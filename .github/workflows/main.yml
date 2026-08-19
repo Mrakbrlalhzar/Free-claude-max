@@ -1,28 +1,60 @@
 name: Build radare2 + r2ghidra for Termux (arm)
-
 on:
   workflow_dispatch:
   push:
-    paths-ignore:
-      - '**.md'
-
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 180
-    
     steps:
       - name: Checkout termux-packages (upstream build system)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: termux/termux-packages
           fetch-depth: 1
 
       - name: Point build.sh at radare2 git master
         run: |
+          RAW_VER=$(grep -m1 "^TERMUX_PKG_VERSION=" packages/radare2/build.sh | cut -d= -f2 | tr -d '"' | tr -d "'")
+          if [ -z "$RAW_VER" ]; then RAW_VER="6.2.0"; fi
+
+          # Preserve a Debian epoch (e.g. "1:6.2.0") if the upstream build.sh has one
+          EPOCH=""
+          BASE_VER="$RAW_VER"
+          case "$RAW_VER" in
+            *:*)
+              EPOCH="${RAW_VER%%:*}"
+              BASE_VER="${RAW_VER#*:}"
+              ;;
+          esac
+
+          # Resolve the exact commit that TERMUX_PKG_GIT_BRANCH=master will check out,
+          # so the package version reflects what's actually being built instead of the
+          # upstream-pinned release number, which never moves on its own and would
+          # otherwise give every build - today, and every future push - the same version.
+          R2_SHA=$(git ls-remote https://github.com/radareorg/radare2.git refs/heads/master | cut -c1-7)
+          if [ -z "$R2_SHA" ]; then
+            echo "::error::Could not resolve radare2 master commit via git ls-remote"
+            exit 1
+          fi
+          R2_DATE=$(date -u +%Y%m%d)
+
+          NEW_VER="${BASE_VER}+git${R2_DATE}.${R2_SHA}"
+          if [ -n "$EPOCH" ]; then NEW_VER="${EPOCH}:${NEW_VER}"; fi
+          echo "Resolved radare2 master commit: $R2_SHA ($R2_DATE)"
+          echo "New TERMUX_PKG_VERSION: $NEW_VER"
+
+          # Share with later steps (r2ghidra step re-derives its own version from the
+          # patched build.sh below; the artifact-upload step uses the plain sha/date
+          # since ':' from an epoch is not a legal artifact-name character)
+          echo "R2_VERSION=${NEW_VER}" >> "$GITHUB_ENV"
+          echo "R2_SHA=${R2_SHA}" >> "$GITHUB_ENV"
+          echo "R2_DATE=${R2_DATE}" >> "$GITHUB_ENV"
+
           sed -i \
             -e 's|^TERMUX_PKG_SRCURL=.*|TERMUX_PKG_SRCURL=git+https://github.com/radareorg/radare2.git|' \
             -e 's|^TERMUX_PKG_SHA256=.*|TERMUX_PKG_SHA256=SKIP_CHECKSUM|' \
+            -e "s|^TERMUX_PKG_VERSION=.*|TERMUX_PKG_VERSION=${NEW_VER}|" \
             packages/radare2/build.sh
           echo 'TERMUX_PKG_GIT_BRANCH=master' >> packages/radare2/build.sh
 
@@ -37,8 +69,7 @@ jobs:
 
       - name: Pre-fetch r2ghidra and compile native sleighc
         run: |
-          sudo apt-get update 
-          sudo apt-get install -y meson ninja-build python3
+          sudo apt-get update && sudo apt-get install -y meson ninja-build
           
           git clone --depth=1 -b master https://github.com/radareorg/r2ghidra.git packages/r2ghidra/git-src
           cd packages/r2ghidra/git-src
@@ -61,7 +92,7 @@ jobs:
           # Extract the EXACT radare2 version being used to guarantee a match and safe filename
           R2_VER=$(grep -m1 "^TERMUX_PKG_VERSION=" packages/radare2/build.sh | cut -d= -f2 | tr -d '"' | tr -d "'")
           R2_VER=${R2_VER#*:} # Remove epoch if present (e.g. 1:6.2.0 -> 6.2.0)
-          R2_VER=${R2_VER:-"6.2.0"} # Fallback if empty
+          if [ -z "$R2_VER" ]; then R2_VER="6.2.0"; fi
           echo "Using exact radare2 version for plugin alignment: $R2_VER"
           
           cat > packages/r2ghidra/build.sh <<'EOF'
@@ -71,7 +102,7 @@ jobs:
           TERMUX_PKG_MAINTAINER="@you"
           
           # @R2_VER@ will be substituted dynamically below
-          TERMUX_PKG_VERSION="@R2_VER@+git"
+          TERMUX_PKG_VERSION="@R2_VER@"
           TERMUX_PKG_SRCURL=git+https://github.com/radareorg/r2ghidra.git
           TERMUX_PKG_SHA256=SKIP_CHECKSUM
           TERMUX_PKG_GIT_BRANCH=master
@@ -153,7 +184,7 @@ jobs:
         run: ./scripts/run-docker.sh ./build-package.sh -a arm -I r2ghidra
 
       - name: Upload all built .deb artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: radare2-and-r2ghidra-termux-arm
+          name: radare2-and-r2ghidra-termux-arm-${{ env.R2_DATE }}-${{ env.R2_SHA }}
           path: output/*.deb
